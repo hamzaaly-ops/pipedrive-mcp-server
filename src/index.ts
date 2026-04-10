@@ -7,6 +7,10 @@ import * as dotenv from 'dotenv';
 import Bottleneck from 'bottleneck';
 import jwt from 'jsonwebtoken';
 import http from 'http';
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 // Type for error handling
 interface ErrorWithMessage {
@@ -31,17 +35,6 @@ function getErrorMessage(error: unknown): string {
 
 // Load environment variables
 dotenv.config();
-
-// Check for required environment variables
-if (!process.env.PIPEDRIVE_API_TOKEN) {
-  console.error("ERROR: PIPEDRIVE_API_TOKEN environment variable is required");
-  process.exit(1);
-}
-
-if (!process.env.PIPEDRIVE_DOMAIN) {
-  console.error("ERROR: PIPEDRIVE_DOMAIN environment variable is required (e.g., 'ukkofi.pipedrive.com')");
-  process.exit(1);
-}
 
 const jwtSecret = process.env.MCP_JWT_SECRET;
 const jwtAlgorithm = (process.env.MCP_JWT_ALGORITHM || 'HS256') as jwt.Algorithm;
@@ -106,30 +99,125 @@ const withRateLimit = <T extends object>(client: T): T => {
   });
 };
 
-// Initialize Pipedrive API client with API token and custom domain
-const apiClient = new pipedrive.ApiClient();
-apiClient.basePath = `https://${process.env.PIPEDRIVE_DOMAIN}/api/v1`;
-apiClient.authentications = apiClient.authentications || {};
-apiClient.authentications['api_key'] = {
-  type: 'apiKey',
-  'in': 'query',
-  name: 'api_token',
-  apiKey: process.env.PIPEDRIVE_API_TOKEN
+interface PipedriveCredentials {
+  apiToken: string;
+  domain: string;
+}
+
+const DEFAULT_SESSION_KEY = "stdio";
+
+const normalizeDomain = (domain: string) =>
+  domain.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+
+const defaultPipedriveCredentials: PipedriveCredentials | undefined =
+  process.env.PIPEDRIVE_API_TOKEN && process.env.PIPEDRIVE_DOMAIN
+    ? {
+        apiToken: process.env.PIPEDRIVE_API_TOKEN,
+        domain: normalizeDomain(process.env.PIPEDRIVE_DOMAIN),
+      }
+    : undefined;
+
+if (!defaultPipedriveCredentials) {
+  console.warn(
+    "No default Pipedrive credentials configured; each session must call the \"authorize-pipedrive\" tool."
+  );
+}
+
+const sessionCredentialStore = new Map<string, PipedriveCredentials>();
+
+const getSessionKey = (extra?: RequestHandlerExtra) =>
+  extra?.sessionId ?? DEFAULT_SESSION_KEY;
+
+const getCredentialsForSession = (extra?: RequestHandlerExtra) => {
+  const sessionKey = getSessionKey(extra);
+  return sessionCredentialStore.get(sessionKey) ?? defaultPipedriveCredentials;
 };
 
-// Initialize Pipedrive API clients
-const dealsApi = withRateLimit(new pipedrive.DealsApi(apiClient));
-const personsApi = withRateLimit(new pipedrive.PersonsApi(apiClient));
-const organizationsApi = withRateLimit(new pipedrive.OrganizationsApi(apiClient));
-const pipelinesApi = withRateLimit(new pipedrive.PipelinesApi(apiClient));
-const itemSearchApi = withRateLimit(new pipedrive.ItemSearchApi(apiClient));
-const leadsApi = withRateLimit(new pipedrive.LeadsApi(apiClient));
-// @ts-ignore - ActivitiesApi exists but may not be in type definitions
-const activitiesApi = withRateLimit(new pipedrive.ActivitiesApi(apiClient));
-// @ts-ignore - NotesApi exists but may not be in type definitions
-const notesApi = withRateLimit(new pipedrive.NotesApi(apiClient));
-// @ts-ignore - UsersApi exists but may not be in type definitions
-const usersApi = withRateLimit(new pipedrive.UsersApi(apiClient));
+const storeCredentialsForSession = (
+  extra: RequestHandlerExtra | undefined,
+  credentials: PipedriveCredentials
+) => {
+  const sessionKey = getSessionKey(extra);
+  sessionCredentialStore.set(sessionKey, credentials);
+  return sessionKey;
+};
+
+const clearCredentialsForSession = (extra?: RequestHandlerExtra) => {
+  const sessionKey = getSessionKey(extra);
+  return sessionCredentialStore.delete(sessionKey);
+};
+
+type PipedriveClients = {
+  dealsApi: pipedrive.DealsApi;
+  personsApi: pipedrive.PersonsApi;
+  organizationsApi: pipedrive.OrganizationsApi;
+  pipelinesApi: pipedrive.PipelinesApi;
+  itemSearchApi: pipedrive.ItemSearchApi;
+  leadsApi: pipedrive.LeadsApi;
+  activitiesApi: pipedrive.ActivitiesApi;
+  notesApi: pipedrive.NotesApi;
+  usersApi: pipedrive.UsersApi;
+};
+
+const createPipedriveClients = (credentials: PipedriveCredentials): PipedriveClients => {
+  const normalizedDomain = normalizeDomain(credentials.domain);
+
+  if (!normalizedDomain) {
+    throw new Error("Invalid Pipedrive domain. Provide a value like 'example.pipedrive.com'.");
+  }
+
+  const apiClient = new pipedrive.ApiClient();
+  apiClient.basePath = `https://${normalizedDomain}/api/v1`;
+  apiClient.authentications = apiClient.authentications || {};
+  apiClient.authentications["api_key"] = {
+    type: "apiKey",
+    in: "query",
+    name: "api_token",
+    apiKey: credentials.apiToken,
+  };
+
+  return {
+    dealsApi: withRateLimit(new pipedrive.DealsApi(apiClient)),
+    personsApi: withRateLimit(new pipedrive.PersonsApi(apiClient)),
+    organizationsApi: withRateLimit(new pipedrive.OrganizationsApi(apiClient)),
+    pipelinesApi: withRateLimit(new pipedrive.PipelinesApi(apiClient)),
+    itemSearchApi: withRateLimit(new pipedrive.ItemSearchApi(apiClient)),
+    leadsApi: withRateLimit(new pipedrive.LeadsApi(apiClient)),
+    activitiesApi: withRateLimit(new pipedrive.ActivitiesApi(apiClient)),
+    notesApi: withRateLimit(new pipedrive.NotesApi(apiClient)),
+    usersApi: withRateLimit(new pipedrive.UsersApi(apiClient)),
+  };
+};
+
+const getPipedriveClients = (extra?: RequestHandlerExtra) => {
+  const credentials = getCredentialsForSession(extra);
+  if (!credentials) {
+    return null;
+  }
+  return createPipedriveClients(credentials);
+};
+
+const textContent = (text: string): CallToolResult["content"] =>
+  [
+    {
+      type: "text" as const,
+      text,
+    },
+  ] as const;
+
+const buildTextResult = (text: string, isError = false): CallToolResult => {
+  const payload: CallToolResult = {
+    content: textContent(text),
+  };
+
+  return isError ? { ...payload, isError: true } : payload;
+};
+
+const missingCredentialsResponse = () =>
+  buildTextResult(
+    `No Pipedrive credentials configured for this session. Run the "authorize-pipedrive" tool with your API token and domain first.`,
+    true
+  );
 
 // Create MCP server
 const server = new McpServer({
@@ -144,12 +232,59 @@ const server = new McpServer({
 
 // === TOOLS ===
 
+// Allow connectors to register their own Pipedrive credentials.
+server.tool(
+  "authorize-pipedrive",
+  "Store Pipedrive API token and domain for this session",
+  {
+    apiToken: z.string().min(1).describe("Pipedrive API token"),
+    domain: z.string().min(1).describe("Pipedrive domain (e.g., 'example.pipedrive.com')"),
+  },
+  async ({ apiToken, domain }, extra) => {
+    const normalizedDomain = normalizeDomain(domain);
+    if (!normalizedDomain) {
+      return buildTextResult(
+        "Provide a valid Pipedrive domain such as 'example.pipedrive.com'.",
+        true
+      );
+    }
+
+    const sessionKey = storeCredentialsForSession(extra, {
+      apiToken,
+      domain: normalizedDomain,
+    });
+
+    return buildTextResult(`Stored credentials for session ${sessionKey}.`);
+  }
+);
+
+server.tool(
+  "clear-pipedrive-authorization",
+  "Remove stored Pipedrive credentials for this session",
+  {},
+  async (_, extra) => {
+    const removed = clearCredentialsForSession(extra);
+    const message = removed
+      ? "Cleared stored credentials for this session."
+      : "No stored credentials were found for this session.";
+
+    return buildTextResult(message);
+  }
+);
+
 // Get all users (for finding owner IDs)
 server.tool(
   "get-users",
   "Get all users/owners from Pipedrive to identify owner IDs for filtering deals",
   {},
-  async () => {
+  async (_, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { usersApi } = clients;
+
     try {
       const response = await usersApi.getUsers();
       const users = response.data?.map((user: any) => ({
@@ -160,24 +295,19 @@ server.tool(
         role_name: user.role_name
       })) || [];
 
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
+      return buildTextResult(
+        JSON.stringify(
+          {
             summary: `Found ${users.length} users in your Pipedrive account`,
-            users: users
-          }, null, 2)
-        }]
-      };
+            users,
+          },
+          null,
+          2
+        )
+      );
     } catch (error) {
       console.error("Error fetching users:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching users: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(`Error fetching users: ${getErrorMessage(error)}`, true);
     }
   }
 );
@@ -207,7 +337,14 @@ server.tool(
     minValue,
     maxValue,
     limit = 500
-  }) => {
+  }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { dealsApi } = clients;
+
     try {
       let filteredDeals: any[] = [];
 
@@ -329,28 +466,23 @@ server.tool(
         booking_details: deal[bookingFieldKey] || null
       }));
 
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
+      return buildTextResult(
+        JSON.stringify(
+          {
             summary: searchTitle
               ? `Found ${filteredDeals.length} deals matching title search "${searchTitle}"`
               : `Found ${filteredDeals.length} deals matching the specified filters`,
             filters_applied: filterSummary,
             total_found: filteredDeals.length,
-            deals: summarizedDeals.slice(0, 30) // Limit to 30 deals max to prevent huge responses
-          }, null, 2)
-        }]
-      };
+            deals: summarizedDeals.slice(0, 30), // Limit to 30 deals max to prevent huge responses
+          },
+          null,
+          2
+        )
+      );
     } catch (error) {
       console.error("Error fetching deals:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching deals: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(`Error fetching deals: ${getErrorMessage(error)}`, true);
     }
   }
 );
@@ -362,25 +494,24 @@ server.tool(
   {
     dealId: z.number().describe("Pipedrive deal ID")
   },
-  async ({ dealId }) => {
+  async ({ dealId }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { dealsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition, API expects just the ID
       const response = await dealsApi.getDeal(dealId);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error fetching deal ${dealId}:`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching deal ${dealId}: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching deal ${dealId}: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -393,7 +524,14 @@ server.tool(
     dealId: z.number().describe("Pipedrive deal ID"),
     limit: z.number().optional().describe("Maximum number of notes to return (default: 20)")
   },
-  async ({ dealId, limit = 20 }) => {
+  async ({ dealId, limit = 20 }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { dealsApi, notesApi } = clients;
+
     try {
       const result: any = {
         deal_id: dealId,
@@ -431,24 +569,22 @@ server.tool(
         result.notes_error = getErrorMessage(noteError);
       }
 
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
+      return buildTextResult(
+        JSON.stringify(
+          {
             summary: `Retrieved ${result.notes.length} notes and booking details for deal ${dealId}`,
-            ...result
-          }, null, 2)
-        }]
-      };
+            ...result,
+          },
+          null,
+          2
+        )
+      );
     } catch (error) {
       console.error(`Error fetching deal notes ${dealId}:`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching deal notes ${dealId}: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching deal notes ${dealId}: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -460,25 +596,24 @@ server.tool(
   {
     term: z.string().describe("Search term for deals")
   },
-  async ({ term }) => {
+  async ({ term }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { dealsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await dealsApi.searchDeals(term);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error searching deals with term "${term}":`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error searching deals: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error searching deals: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -488,24 +623,23 @@ server.tool(
   "get-persons",
   "Get all persons from Pipedrive including custom fields",
   {},
-  async () => {
+  async (_, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { personsApi } = clients;
+
     try {
       const response = await personsApi.getPersons();
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error("Error fetching persons:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching persons: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching persons: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -517,25 +651,24 @@ server.tool(
   {
     personId: z.number().describe("Pipedrive person ID")
   },
-  async ({ personId }) => {
+  async ({ personId }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { personsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await personsApi.getPerson(personId);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error fetching person ${personId}:`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching person ${personId}: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching person ${personId}: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -547,25 +680,24 @@ server.tool(
   {
     term: z.string().describe("Search term for persons")
   },
-  async ({ term }) => {
+  async ({ term }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { personsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await personsApi.searchPersons(term);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error searching persons with term "${term}":`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error searching persons: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error searching persons: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -575,24 +707,23 @@ server.tool(
   "get-organizations",
   "Get all organizations from Pipedrive including custom fields",
   {},
-  async () => {
+  async (_, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { organizationsApi } = clients;
+
     try {
       const response = await organizationsApi.getOrganizations();
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error("Error fetching organizations:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching organizations: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching organizations: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -604,25 +735,24 @@ server.tool(
   {
     organizationId: z.number().describe("Pipedrive organization ID")
   },
-  async ({ organizationId }) => {
+  async ({ organizationId }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { organizationsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await organizationsApi.getOrganization(organizationId);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error fetching organization ${organizationId}:`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching organization ${organizationId}: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching organization ${organizationId}: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -634,25 +764,24 @@ server.tool(
   {
     term: z.string().describe("Search term for organizations")
   },
-  async ({ term }) => {
+  async ({ term }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { organizationsApi } = clients;
+
     try {
       // @ts-ignore - API method exists but TypeScript definition is wrong
       const response = await (organizationsApi as any).searchOrganization({ term });
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error searching organizations with term "${term}":`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error searching organizations: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error searching organizations: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -662,24 +791,23 @@ server.tool(
   "get-pipelines",
   "Get all pipelines from Pipedrive",
   {},
-  async () => {
+  async (_, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { pipelinesApi } = clients;
+
     try {
       const response = await pipelinesApi.getPipelines();
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error("Error fetching pipelines:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching pipelines: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching pipelines: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -691,25 +819,24 @@ server.tool(
   {
     pipelineId: z.number().describe("Pipedrive pipeline ID")
   },
-  async ({ pipelineId }) => {
+  async ({ pipelineId }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { pipelinesApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await pipelinesApi.getPipeline(pipelineId);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error fetching pipeline ${pipelineId}:`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching pipeline ${pipelineId}: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching pipeline ${pipelineId}: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -719,7 +846,14 @@ server.tool(
   "get-stages",
   "Get all stages from Pipedrive",
   {},
-  async () => {
+  async (_, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { pipelinesApi } = clients;
+
     try {
       // Since the stages are related to pipelines, we'll get all pipelines first
       const pipelinesResponse = await pipelinesApi.getPipelines();
@@ -747,21 +881,13 @@ server.tool(
         }
       }
       
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(allStages, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(allStages, null, 2));
     } catch (error) {
       console.error("Error fetching stages:", error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching stages: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error fetching stages: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -773,25 +899,24 @@ server.tool(
   {
     term: z.string().describe("Search term for leads")
   },
-  async ({ term }) => {
+  async ({ term }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { leadsApi } = clients;
+
     try {
       // @ts-ignore - Bypass incorrect TypeScript definition
       const response = await leadsApi.searchLeads(term);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error searching leads with term "${term}":`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error searching leads: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error searching leads: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );
@@ -804,28 +929,27 @@ server.tool(
     term: z.string().describe("Search term"),
     itemTypes: z.string().optional().describe("Comma-separated list of item types to search (deal,person,organization,product,file,activity,lead)")
   },
-  async ({ term, itemTypes }) => {
+  async ({ term, itemTypes }, extra) => {
+    const clients = getPipedriveClients(extra);
+    if (!clients) {
+      return missingCredentialsResponse();
+    }
+
+    const { itemSearchApi } = clients;
+
     try {
       const itemType = itemTypes; // Just rename the parameter
       const response = await itemSearchApi.searchItem({ 
         term,
         itemType 
       });
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(response.data, null, 2)
-        }]
-      };
+      return buildTextResult(JSON.stringify(response.data, null, 2));
     } catch (error) {
       console.error(`Error performing search with term "${term}":`, error);
-      return {
-        content: [{
-          type: "text",
-          text: `Error performing search: ${getErrorMessage(error)}`
-        }],
-        isError: true
-      };
+      return buildTextResult(
+        `Error performing search: ${getErrorMessage(error)}`,
+        true
+      );
     }
   }
 );

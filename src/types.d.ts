@@ -58,4 +58,19 @@ declare module 'pipedrive' {
     constructor(apiClient: ApiClient);
     searchLeads(params: { term: string }): Promise<any>;
   }
+
+  export class ActivitiesApi {
+    constructor(apiClient: ApiClient);
+    getActivities(params?: Record<string, unknown>): Promise<any>;
+  }
+
+  export class NotesApi {
+    constructor(apiClient: ApiClient);
+    getNotes(params?: Record<string, unknown>): Promise<any>;
+  }
+
+  export class UsersApi {
+    constructor(apiClient: ApiClient);
+    getUsers(params?: Record<string, unknown>): Promise<any>;
+  }
 } 
