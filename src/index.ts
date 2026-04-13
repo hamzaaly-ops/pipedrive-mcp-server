@@ -340,31 +340,92 @@ const OAUTH_HOST_DEFAULT = "https://oauth.pipedrive.com";
 const oauthClientId = process.env.PIPEDRIVE_OAUTH_CLIENT_ID;
 const oauthClientSecret = process.env.PIPEDRIVE_OAUTH_CLIENT_SECRET;
 const oauthRedirectUri = process.env.PIPEDRIVE_OAUTH_REDIRECT_URI;
-const oauthHost = process.env.PIPEDRIVE_OAUTH_HOST || OAUTH_HOST_DEFAULT;
+const oauthHostEnv = process.env.PIPEDRIVE_OAUTH_HOST || OAUTH_HOST_DEFAULT;
 const oauthScopes = process.env.PIPEDRIVE_OAUTH_SCOPES;
-const oauthConfigured = Boolean(oauthClientId && oauthClientSecret && oauthRedirectUri);
+const OAUTH_CONFIG_FILE = path.join(STORAGE_DIR, "oauth-config.json");
 const oauthStateStore = new Map<string, { sessionKey: string; tenantId?: string }>();
 
+type OAuthConfig = {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  host?: string;
+  scopes?: string;
+};
+
+let oauthConfig: OAuthConfig | undefined;
+
+const loadOAuthConfig = () => {
+  if (!fs.existsSync(OAUTH_CONFIG_FILE)) {
+    return;
+  }
+  try {
+    const contents = fs.readFileSync(OAUTH_CONFIG_FILE, "utf-8");
+    oauthConfig = JSON.parse(contents);
+  } catch (error) {
+    console.error("Failed to load OAuth config:", error);
+  }
+};
+
+const persistOAuthConfig = (config: OAuthConfig) => {
+  ensureStorageDirectory();
+  fs.writeFileSync(OAUTH_CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
+  oauthConfig = config;
+};
+
+const getOAuthConfig = (): OAuthConfig | undefined => {
+  if (oauthConfig) {
+    return oauthConfig;
+  }
+  if (oauthClientId && oauthClientSecret && oauthRedirectUri) {
+    const config: OAuthConfig = {
+      clientId: oauthClientId,
+      clientSecret: oauthClientSecret,
+      redirectUri: oauthRedirectUri,
+      host: oauthHostEnv !== OAUTH_HOST_DEFAULT ? oauthHostEnv : undefined,
+      scopes: oauthScopes,
+    };
+    persistOAuthConfig(config);
+    return config;
+  }
+  return undefined;
+};
+
+loadOAuthConfig();
+
+const isOAuthConfigured = () => Boolean(getOAuthConfig());
+
 const createOAuthApiClient = () => {
+  const config = getOAuthConfig();
+  if (!config) {
+    throw new Error("OAuth configuration is missing");
+  }
+
   const oauthClient = new pipedrive.ApiClient();
   oauthClient.authentications = oauthClient.authentications || {};
   oauthClient.authentications.oauth2 = {
     type: "oauth2",
-    host: oauthHost,
-    clientId: oauthClientId!,
-    clientSecret: oauthClientSecret!,
-    redirectUri: oauthRedirectUri!,
+    host: config.host ?? OAUTH_HOST_DEFAULT,
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    redirectUri: config.redirectUri,
   };
   return oauthClient;
 };
 
 const buildOAuthAuthorizationUrl = (state: string) => {
+  const config = getOAuthConfig();
+  if (!config) {
+    throw new Error("OAuth configuration is missing");
+  }
+
   const oauthClient = createOAuthApiClient();
   const url = new URL(oauthClient.buildAuthorizationUrl());
   url.searchParams.set("state", state);
   url.searchParams.set("response_type", "code");
-  if (oauthScopes) {
-    url.searchParams.set("scope", oauthScopes);
+  const scopes = config.scopes ?? oauthScopes;
+  if (scopes) {
+    url.searchParams.set("scope", scopes);
   }
   return url.toString();
 };
@@ -432,7 +493,7 @@ server.tool(
     tenantId: z.string().min(1).optional().describe("Optional stable tenant identifier (e.g., your customer slug)"),
   },
   async ({ tenantId }, extra) => {
-    if (!oauthConfigured) {
+    if (!isOAuthConfigured()) {
       return buildTextResult(
         "OAuth is not configured on this server. Set PIPEDRIVE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI.",
         true
@@ -449,6 +510,29 @@ server.tool(
     return buildTextResult(
       `Open this URL in your browser to authorize your Pipedrive account:\n${authUrl}`
     );
+  }
+);
+
+server.tool(
+  "set-pipedrive-oauth-config",
+  "Persist OAuth client credentials (client_id, secret, redirect URI)",
+  {
+    clientId: z.string().min(1).describe("Pipedrive OAuth client ID"),
+    clientSecret: z.string().min(1).describe("Pipedrive OAuth client secret"),
+    redirectUri: z.string().min(1).describe("OAuth redirect URI (https://...)"),
+    host: z.string().optional().describe("OAuth host (default: https://oauth.pipedrive.com)"),
+    scopes: z.string().optional().describe("Comma-separated scopes (e.g., read,write)"),
+  },
+  async ({ clientId, clientSecret, redirectUri, host, scopes }) => {
+    persistOAuthConfig({
+      clientId,
+      clientSecret,
+      redirectUri,
+      host: host?.trim() || undefined,
+      scopes: scopes?.trim() || undefined,
+    });
+
+    return buildTextResult("OAuth client configuration stored.");
   }
 );
 
@@ -1396,7 +1480,7 @@ if (transportType === 'sse') {
         }
       }
     } else if (req.method === 'GET' && url.pathname === '/oauth/callback') {
-      if (!oauthConfigured) {
+      if (!isOAuthConfigured()) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('OAuth is not configured on this server.');
         return;
