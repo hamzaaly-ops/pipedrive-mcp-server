@@ -1405,14 +1405,14 @@ if (transportType === 'sse') {
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
 
-      if (!code || !state) {
+      if (!code) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Missing code or state.');
+        res.end('Missing authorization code.');
         return;
       }
 
-      const payload = consumeOAuthState(state);
-      if (!payload) {
+      const payload = state ? consumeOAuthState(state) : undefined;
+      if (state && !payload) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Invalid or expired state.');
         return;
@@ -1441,8 +1441,18 @@ if (transportType === 'sse') {
           expiresAt: oauthAuth.expiresAt,
         };
 
-        const tenantId = payload.tenantId ?? payload.sessionKey;
-        setTenantForSession(payload.sessionKey, tenantId);
+        const providedTenant =
+          url.searchParams.get('tenant') || url.searchParams.get('tenantId');
+
+        const tenantId =
+          payload?.tenantId ??
+          providedTenant ??
+          'default';
+
+        if (payload?.sessionKey) {
+          setTenantForSession(payload.sessionKey, tenantId);
+        }
+
         storeTenantCredentials(tenantId, oauthCredentials);
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
