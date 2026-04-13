@@ -13,12 +13,22 @@ declare module 'pipedrive' {
       };
       oauth2: {
         type: string;
-        accessToken: string;
+        accessToken?: string;
+        refreshToken?: string;
+        expiresAt?: number;
+        host?: string;
+        clientId?: string;
+        clientSecret?: string;
+        redirectUri?: string;
+        tokenUpdateCallback?: (token: Record<string, unknown>) => void;
       };
     };
     defaultHeaders: Record<string, string>;
     timeout: number;
     constructor();
+    buildAuthorizationUrl(): string;
+    authorize(code: string): Promise<any>;
+    refreshToken(): Promise<any>;
   }
 
   export class DealsApi {

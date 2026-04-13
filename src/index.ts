@@ -7,6 +7,9 @@ import * as dotenv from 'dotenv';
 import Bottleneck from 'bottleneck';
 import jwt from 'jsonwebtoken';
 import http from 'http';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
@@ -99,10 +102,21 @@ const withRateLimit = <T extends object>(client: T): T => {
   });
 };
 
-interface PipedriveCredentials {
+type ApiKeyCredentials = {
+  type: "apiKey";
   apiToken: string;
   domain: string;
-}
+};
+
+type OAuthCredentials = {
+  type: "oauth";
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  domain: string;
+};
+
+type PipedriveCredentials = ApiKeyCredentials | OAuthCredentials;
 
 const DEFAULT_SESSION_KEY = "stdio";
 
@@ -112,6 +126,7 @@ const normalizeDomain = (domain: string) =>
 const defaultPipedriveCredentials: PipedriveCredentials | undefined =
   process.env.PIPEDRIVE_API_TOKEN && process.env.PIPEDRIVE_DOMAIN
     ? {
+        type: "apiKey",
         apiToken: process.env.PIPEDRIVE_API_TOKEN,
         domain: normalizeDomain(process.env.PIPEDRIVE_DOMAIN),
       }
@@ -119,32 +134,98 @@ const defaultPipedriveCredentials: PipedriveCredentials | undefined =
 
 if (!defaultPipedriveCredentials) {
   console.warn(
-    "No default Pipedrive credentials configured; each session must call the \"authorize-pipedrive\" tool."
+    "No default Pipedrive credentials configured; each session must authorize before calling the tools."
   );
 }
 
-const sessionCredentialStore = new Map<string, PipedriveCredentials>();
+const STORAGE_DIR = path.resolve(process.cwd(), "storage");
+const TENANT_STORE_FILE = path.join(STORAGE_DIR, "tenant-credentials.json");
+
+const ensureStorageDirectory = () => {
+  if (!fs.existsSync(STORAGE_DIR)) {
+    fs.mkdirSync(STORAGE_DIR, { recursive: true });
+  }
+};
+
+type StoredTenantCredentials = {
+  type: "apiKey";
+  apiToken: string;
+  domain: string;
+} | {
+  type: "oauth";
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  domain: string;
+};
+
+const tenantCredentialStore = new Map<string, PipedriveCredentials>();
+
+const persistTenantCredentials = () => {
+  ensureStorageDirectory();
+  const payload: Record<string, StoredTenantCredentials> = {};
+  for (const [tenantId, credentials] of tenantCredentialStore.entries()) {
+    payload[tenantId] = { ...credentials } as StoredTenantCredentials;
+  }
+  fs.writeFileSync(TENANT_STORE_FILE, JSON.stringify(payload, null, 2), "utf-8");
+};
+
+const loadTenantCredentials = () => {
+  if (!fs.existsSync(TENANT_STORE_FILE)) {
+    return;
+  }
+  try {
+    const contents = fs.readFileSync(TENANT_STORE_FILE, "utf-8");
+    const parsed: Record<string, StoredTenantCredentials> = JSON.parse(contents);
+    for (const [tenantId, creds] of Object.entries(parsed)) {
+      tenantCredentialStore.set(tenantId, creds);
+    }
+  } catch (error) {
+    console.error("Failed to load tenant credentials:", error);
+  }
+};
+
+loadTenantCredentials();
+
+const sessionTenantMap = new Map<string, string>();
+
+const setTenantForSession = (sessionKey: string, tenantId: string) => {
+  if (tenantId) {
+    sessionTenantMap.set(sessionKey, tenantId);
+  }
+};
+
+const getTenantForSession = (sessionKey: string) => sessionTenantMap.get(sessionKey);
+
+const clearTenantForSession = (sessionKey: string) => sessionTenantMap.delete(sessionKey);
 
 const getSessionKey = (extra?: RequestHandlerExtra) =>
   extra?.sessionId ?? DEFAULT_SESSION_KEY;
 
-const getCredentialsForSession = (extra?: RequestHandlerExtra) => {
+const resolveTenantId = (extra?: RequestHandlerExtra, providedTenant?: string) => {
+  if (providedTenant) {
+    return providedTenant;
+  }
   const sessionKey = getSessionKey(extra);
-  return sessionCredentialStore.get(sessionKey) ?? defaultPipedriveCredentials;
+  return getTenantForSession(sessionKey) ?? sessionKey;
 };
 
-const storeCredentialsForSession = (
-  extra: RequestHandlerExtra | undefined,
+const storeTenantCredentials = (
+  tenantId: string,
   credentials: PipedriveCredentials
 ) => {
-  const sessionKey = getSessionKey(extra);
-  sessionCredentialStore.set(sessionKey, credentials);
-  return sessionKey;
+  tenantCredentialStore.set(tenantId, credentials);
+  persistTenantCredentials();
+  return tenantId;
 };
 
-const clearCredentialsForSession = (extra?: RequestHandlerExtra) => {
+const getCredentialsForSession = (extra?: RequestHandlerExtra) => {
   const sessionKey = getSessionKey(extra);
-  return sessionCredentialStore.delete(sessionKey);
+  const tenantId = getTenantForSession(sessionKey);
+  if (tenantId && tenantCredentialStore.has(tenantId)) {
+    return tenantCredentialStore.get(tenantId);
+  }
+  return defaultPipedriveCredentials;
 };
 
 type PipedriveClients = {
@@ -159,7 +240,10 @@ type PipedriveClients = {
   usersApi: pipedrive.UsersApi;
 };
 
-const createPipedriveClients = (credentials: PipedriveCredentials): PipedriveClients => {
+const createPipedriveClients = (
+  credentials: PipedriveCredentials,
+  onTokenUpdate?: (updated: OAuthCredentials) => void
+): PipedriveClients => {
   const normalizedDomain = normalizeDomain(credentials.domain);
 
   if (!normalizedDomain) {
@@ -169,12 +253,33 @@ const createPipedriveClients = (credentials: PipedriveCredentials): PipedriveCli
   const apiClient = new pipedrive.ApiClient();
   apiClient.basePath = `https://${normalizedDomain}/api/v1`;
   apiClient.authentications = apiClient.authentications || {};
-  apiClient.authentications["api_key"] = {
-    type: "apiKey",
-    in: "query",
-    name: "api_token",
-    apiKey: credentials.apiToken,
-  };
+
+  if (credentials.type === "apiKey") {
+    apiClient.authentications["api_key"] = {
+      type: "apiKey",
+      in: "query",
+      name: "api_token",
+      apiKey: credentials.apiToken,
+    };
+  } else {
+    apiClient.authentications["oauth2"] = {
+      type: "oauth2",
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      expiresAt: credentials.expiresAt,
+      tokenUpdateCallback: (token: any) => {
+        const updated: OAuthCredentials = {
+          type: "oauth",
+          domain: credentials.domain,
+          accessToken: token.access_token ?? credentials.accessToken,
+          refreshToken: token.refresh_token ?? credentials.refreshToken,
+          expiresAt: token.expires_in ? Date.now() + token.expires_in * 1000 : credentials.expiresAt,
+        };
+
+        onTokenUpdate?.(updated);
+      },
+    };
+  }
 
   return {
     dealsApi: withRateLimit(new pipedrive.DealsApi(apiClient)),
@@ -194,7 +299,19 @@ const getPipedriveClients = (extra?: RequestHandlerExtra) => {
   if (!credentials) {
     return null;
   }
-  return createPipedriveClients(credentials);
+
+  const onTokenUpdate =
+    credentials.type === "oauth"
+      ? (updated: OAuthCredentials) => {
+          const sessionKey = getSessionKey(extra);
+          const tenantId = getTenantForSession(sessionKey);
+          if (tenantId) {
+            storeTenantCredentials(tenantId, updated);
+          }
+        }
+      : undefined;
+
+  return createPipedriveClients(credentials, onTokenUpdate);
 };
 
 const textContent = (text: string): CallToolResult["content"] =>
@@ -215,9 +332,54 @@ const buildTextResult = (text: string, isError = false): CallToolResult => {
 
 const missingCredentialsResponse = () =>
   buildTextResult(
-    `No Pipedrive credentials configured for this session. Run the "authorize-pipedrive" tool with your API token and domain first.`,
+    `No Pipedrive credentials configured for this session. Run "get-pipedrive-oauth-url" or "authorize-pipedrive" to provide credentials.`,
     true
   );
+
+const OAUTH_HOST_DEFAULT = "https://oauth.pipedrive.com";
+const oauthClientId = process.env.PIPEDRIVE_OAUTH_CLIENT_ID;
+const oauthClientSecret = process.env.PIPEDRIVE_OAUTH_CLIENT_SECRET;
+const oauthRedirectUri = process.env.PIPEDRIVE_OAUTH_REDIRECT_URI;
+const oauthHost = process.env.PIPEDRIVE_OAUTH_HOST || OAUTH_HOST_DEFAULT;
+const oauthScopes = process.env.PIPEDRIVE_OAUTH_SCOPES;
+const oauthConfigured = Boolean(oauthClientId && oauthClientSecret && oauthRedirectUri);
+const oauthStateStore = new Map<string, { sessionKey: string; tenantId?: string }>();
+
+const createOAuthApiClient = () => {
+  const oauthClient = new pipedrive.ApiClient();
+  oauthClient.authentications = oauthClient.authentications || {};
+  oauthClient.authentications.oauth2 = {
+    type: "oauth2",
+    host: oauthHost,
+    clientId: oauthClientId!,
+    clientSecret: oauthClientSecret!,
+    redirectUri: oauthRedirectUri!,
+  };
+  return oauthClient;
+};
+
+const buildOAuthAuthorizationUrl = (state: string) => {
+  const oauthClient = createOAuthApiClient();
+  const url = new URL(oauthClient.buildAuthorizationUrl());
+  url.searchParams.set("state", state);
+  url.searchParams.set("response_type", "code");
+  if (oauthScopes) {
+    url.searchParams.set("scope", oauthScopes);
+  }
+  return url.toString();
+};
+
+const registerOAuthState = (sessionKey: string, tenantId?: string) => {
+  const state = crypto.randomUUID();
+  oauthStateStore.set(state, { sessionKey, tenantId });
+  return state;
+};
+
+const consumeOAuthState = (state: string) => {
+  const payload = oauthStateStore.get(state);
+  oauthStateStore.delete(state);
+  return payload;
+};
 
 // Create MCP server
 const server = new McpServer({
@@ -239,8 +401,9 @@ server.tool(
   {
     apiToken: z.string().min(1).describe("Pipedrive API token"),
     domain: z.string().min(1).describe("Pipedrive domain (e.g., 'example.pipedrive.com')"),
+    tenantId: z.string().min(1).optional().describe("Optional tenant identifier for your customer"),
   },
-  async ({ apiToken, domain }, extra) => {
+  async ({ apiToken, domain, tenantId }, extra) => {
     const normalizedDomain = normalizeDomain(domain);
     if (!normalizedDomain) {
       return buildTextResult(
@@ -249,24 +412,72 @@ server.tool(
       );
     }
 
-    const sessionKey = storeCredentialsForSession(extra, {
+    const tenantKey = resolveTenantId(extra, tenantId?.trim());
+    setTenantForSession(getSessionKey(extra), tenantKey);
+
+    const storedTenant = storeTenantCredentials(tenantKey, {
+      type: "apiKey",
       apiToken,
       domain: normalizedDomain,
     });
 
-    return buildTextResult(`Stored credentials for session ${sessionKey}.`);
+    return buildTextResult(`Stored credentials for tenant ${storedTenant}.`);
+  }
+);
+
+server.tool(
+  "get-pipedrive-oauth-url",
+  "Get a one-time URL to authorize your Pipedrive account via OAuth",
+  {
+    tenantId: z.string().min(1).optional().describe("Optional stable tenant identifier (e.g., your customer slug)"),
+  },
+  async ({ tenantId }, extra) => {
+    if (!oauthConfigured) {
+      return buildTextResult(
+        "OAuth is not configured on this server. Set PIPEDRIVE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI.",
+        true
+      );
+    }
+
+    const sessionKey = getSessionKey(extra);
+    const tenantKey = resolveTenantId(extra, tenantId?.trim());
+    setTenantForSession(sessionKey, tenantKey);
+
+    const state = registerOAuthState(sessionKey, tenantKey);
+    const authUrl = buildOAuthAuthorizationUrl(state);
+
+    return buildTextResult(
+      `Open this URL in your browser to authorize your Pipedrive account:\n${authUrl}`
+    );
   }
 );
 
 server.tool(
   "clear-pipedrive-authorization",
-  "Remove stored Pipedrive credentials for this session",
-  {},
-  async (_, extra) => {
-    const removed = clearCredentialsForSession(extra);
+  "Remove stored Pipedrive credentials for this session or tenant",
+  {
+    tenantId: z.string().min(1).optional().describe("Tenant identifier whose credentials should be cleared"),
+  },
+  async ({ tenantId }, extra) => {
+    const sessionKey = getSessionKey(extra);
+    const targetTenantId = tenantId?.trim() || getTenantForSession(sessionKey);
+
+    if (!targetTenantId) {
+      return buildTextResult(
+        "No tenant identifier found for this session. Provide tenantId or call authorize first.",
+        true
+      );
+    }
+
+    const removed = tenantCredentialStore.delete(targetTenantId);
+    if (removed) {
+      persistTenantCredentials();
+      clearTenantForSession(sessionKey);
+    }
+
     const message = removed
-      ? "Cleared stored credentials for this session."
-      : "No stored credentials were found for this session.";
+      ? `Cleared stored credentials for tenant ${targetTenantId}.`
+      : `No stored credentials found for tenant ${targetTenantId}.`;
 
     return buildTextResult(message);
   }
@@ -1121,12 +1332,19 @@ if (transportType === 'sse') {
       console.error('New SSE connection request');
       const transport = new SSEServerTransport(endpoint, res);
 
+      const tenantIdQuery =
+        url.searchParams.get('tenant') || url.searchParams.get('tenantId');
+      if (tenantIdQuery) {
+        setTenantForSession(transport.sessionId, tenantIdQuery);
+      }
+
       // Store transport by session ID
       transports.set(transport.sessionId, transport);
 
       transport.onclose = () => {
         console.error(`SSE connection closed: ${transport.sessionId}`);
         transports.delete(transport.sessionId);
+        clearTenantForSession(transport.sessionId);
       };
 
       try {
@@ -1176,6 +1394,63 @@ if (transportType === 'sse') {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Internal server error' }));
         }
+      }
+    } else if (req.method === 'GET' && url.pathname === '/oauth/callback') {
+      if (!oauthConfigured) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('OAuth is not configured on this server.');
+        return;
+      }
+
+      const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
+
+      if (!code || !state) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Missing code or state.');
+        return;
+      }
+
+      const payload = consumeOAuthState(state);
+      if (!payload) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Invalid or expired state.');
+        return;
+      }
+
+      try {
+        const oauthClient = createOAuthApiClient();
+        await oauthClient.authorize(code);
+        const oauthAuth = oauthClient.authentications.oauth2;
+        const domain = oauthClient.basePath ? new URL(oauthClient.basePath).hostname : null;
+        const accessToken = oauthAuth.accessToken;
+
+        if (!domain) {
+          throw new Error("Failed to determine Pipedrive domain from the OAuth response.");
+        }
+
+        if (!accessToken) {
+          throw new Error("OAuth access token missing from the response.");
+        }
+
+        const oauthCredentials: OAuthCredentials = {
+          type: "oauth",
+          domain: normalizeDomain(domain),
+          accessToken,
+          refreshToken: oauthAuth.refreshToken,
+          expiresAt: oauthAuth.expiresAt,
+        };
+
+        const tenantId = payload.tenantId ?? payload.sessionKey;
+        setTenantForSession(payload.sessionKey, tenantId);
+        storeTenantCredentials(tenantId, oauthCredentials);
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end("<h1>Success!</h1><p>Your Pipedrive account is connected. You can return to your connector.</p>");
+      } catch (error) {
+        console.error("Pipedrive OAuth callback failed:", error);
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end("Failed to process OAuth callback. Check the server logs for details.");
       }
     } else {
       // Health check endpoint
